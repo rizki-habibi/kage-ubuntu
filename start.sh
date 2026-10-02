@@ -46,12 +46,19 @@ if [ ! -S /run/dbus/system_bus_socket ]; then
 fi
 
 echo "[max-ubuntu] starting Ubuntu GNOME desktop"
+# Force GNOME/Mutter into software-rendered X11 mode so Xvfb does not produce a black screen.
+export LIBGL_ALWAYS_SOFTWARE=1
+export MESA_LOADER_DRIVER_OVERRIDE=llvmpipe
+export GDK_BACKEND=x11
+export CLUTTER_BACKEND=x11
+export MUTTER_DEBUG_DISABLE_HW_CURSORS=1
+export NO_AT_BRIDGE=1
 rm -rf /tmp/runtime-ubuntu
 mkdir -p /tmp/runtime-ubuntu
 chown ubuntu:ubuntu /tmp/runtime-ubuntu
 chmod 700 /tmp/runtime-ubuntu
 
-su - ubuntu -c 'export DISPLAY=:1 XDG_RUNTIME_DIR=/tmp/runtime-ubuntu XDG_CURRENT_DESKTOP=ubuntu:GNOME XDG_SESSION_TYPE=x11; dbus-run-session -- gnome-session --session=ubuntu' >/tmp/gnome.log 2>&1 &
+su - ubuntu -c 'export DISPLAY=:1 XDG_RUNTIME_DIR=/tmp/runtime-ubuntu XDG_CURRENT_DESKTOP=ubuntu:GNOME XDG_SESSION_TYPE=x11 LIBGL_ALWAYS_SOFTWARE=1 MESA_LOADER_DRIVER_OVERRIDE=llvmpipe GDK_BACKEND=x11 CLUTTER_BACKEND=x11 MUTTER_DEBUG_DISABLE_HW_CURSORS=1 NO_AT_BRIDGE=1; dbus-run-session -- gnome-session --session=ubuntu' >/tmp/gnome.log 2>&1 &
 DESKTOP_PID=$!
 
 sleep 8
@@ -71,6 +78,9 @@ if ! kill -0 "$VNC_PID" 2>/dev/null; then
   cat /tmp/x11vnc.log || true
   exit 1
 fi
+
+echo "[max-ubuntu] configuring noVNC landing page"
+printf '%s\n' '<!doctype html><meta http-equiv="refresh" content="0;url=/vnc.html?autoconnect=true&resize=scale"><title>Ubuntu Desktop</title>' > /usr/share/novnc/index.html
 
 echo "[max-ubuntu] starting noVNC on 0.0.0.0:$PORT"
 websockify --web=/usr/share/novnc 0.0.0.0:"$PORT" 127.0.0.1:5900 >/tmp/novnc.log 2>&1 &
