@@ -33,18 +33,17 @@ jobs:
           test -f Dockerfile
           test -f start.sh
 
-      - name: Validate Dockerfile and startup script
+      - name: Static error detection
         shell: bash
         run: |
           set -euo pipefail
-
           grep -q '^FROM ubuntu:24.04' Dockerfile
           grep -q 'ENTRYPOINT' Dockerfile
           grep -q 'x11-utils' Dockerfile
           grep -q 'firefox.tar.xz' Dockerfile
           grep -q 'tar -xJf' Dockerfile
           ! grep -Eq '\\bfirefox-esr\\b' Dockerfile
-
+          grep -q 'id -u ubuntu' Dockerfile
           bash -n start.sh
           grep -q 'PORT=${PORT:-8080}' start.sh
           grep -q 'Xvfb' start.sh
@@ -56,14 +55,13 @@ jobs:
       - name: Build Docker image
         shell: bash
         run: |
-          set -euo pipefail
+          set -Eeuo pipefail
           docker build --pull --progress=plain -t max-ubuntu-ci:latest .
 
       - name: Smoke test desktop container
         shell: bash
         run: |
           set -Eeuo pipefail
-
           docker run -d --name max-ubuntu-smoke -e PORT=8080 -p 18080:8080 max-ubuntu-ci:latest
 
           cleanup() {
@@ -72,11 +70,10 @@ jobs:
           }
           trap cleanup EXIT
 
-          ready=0
           for i in $(seq 1 90); do
             if curl -fsS --max-time 2 http://127.0.0.1:18080/vnc.html >/dev/null; then
-              ready=1
-              break
+              echo "Ubuntu desktop smoke test OK."
+              exit 0
             fi
             if ! docker inspect -f '{{.State.Running}}' max-ubuntu-smoke 2>/dev/null | grep -q true; then
               echo "::error::Container berhenti sebelum noVNC siap."
@@ -85,12 +82,8 @@ jobs:
             sleep 1
           done
 
-          if [ "$ready" -ne 1 ]; then
-            echo "::error::noVNC tidak merespons pada PORT 8080."
-            exit 1
-          fi
-
-          echo "Ubuntu desktop smoke test OK."
+          echo "::error::noVNC tidak merespons pada PORT 8080."
+          exit 1
 
   railway-logs:
     name: Detect Railway Errors
@@ -112,44 +105,55 @@ jobs:
         shell: bash
         run: |
           set -Eeuo pipefail
+          touch railway-deploy.json railway-build.json railway-http.json
 
-          if [ -z "${RAILWAY_TOKEN:-}" ]; then
-            echo "::warning::RAILWAY_TOKEN belum tersedia; validasi Docker tetap berjalan, tetapi log Railway tidak dapat dibaca dari GitHub Actions."
-            exit 0
+          if [ -n "${RAILWAY_TOKEN:-}" ]; then
+            railway logs "${DEPLOYMENT_ID}" --project "${PROJECT_ID}" --service "${SERVICE}" --environment "${ENVIRONMENT}" --lines 500 --json > railway-deploy.json || true
+            railway logs "${DEPLOYMENT_ID}" --project "${PROJECT_ID}" --service "${SERVICE}" --environment "${ENVIRONMENT}" --build --lines 500 --json > railway-build.json || true
+            railway logs "${DEPLOYMENT_ID}" --project "${PROJECT_ID}" --service "${SERVICE}" --environment "${ENVIRONMENT}" --http --lines 200 --json > railway-http.json || true
+          else
+            echo "::warning::RAILWAY_TOKEN belum tersedia; memakai hasil static/Docker validation saja."
           fi
 
-          railway logs "${DEPLOYMENT_ID}" --project "${PROJECT_ID}" --service "${SERVICE}" --environment "${ENVIRONMENT}" --lines 500 --json > railway-deploy.json || true
-          railway logs "${DEPLOYMENT_ID}" --project "${PROJECT_ID}" --service "${SERVICE}" --environment "${ENVIRONMENT}" --build --lines 500 --json > railway-build.json || true
-          railway logs "${DEPLOYMENT_ID}" --project "${PROJECT_ID}" --service "${SERVICE}" --environment "${ENVIRONMENT}" --http --lines 200 --json > railway-http.json || true
-
-          echo "===== RAILWAY DEPLOY LOG ====="
-          cat railway-deploy.json || true
-          echo "===== RAILWAY BUILD LOG ====="
-          cat railway-build.json || true
-          echo "===== RAILWAY HTTP LOG ====="
-          cat railway-http.json || true
-
-      - name: Detect known Railway errors
-        if: always()
-        shell: bash
-        run: |
-          set -euo pipefail
-          touch railway-deploy.json railway-build.json railway-http.json
           cat railway-deploy.json railway-build.json railway-http.json > railway-all.log
 
-          echo "===== DETECTED ERROR PATTERNS ====="
+          echo "===== AUTOMATIC ERROR DETECTION ====="
+          patterns=(
+            'useradd: user .* already exists'
+            'exit code: 9'
+            'exit code: [1-9][0-9]*'
+            'failed to solve'
+            'failed to build'
+            'firefox.*tar'
+            'bzip2.*not a bzip2'
+            'no installation candidate'
+            'permission denied'
+            'cannot open display'
+            'DISPLAY.*not set'
+            'Xvfb.*failed'
+            'x11vnc.*failed'
+            'websockify.*failed'
+            'noVNC.*failed'
+            'healthcheck'
+            'service unavailable'
+            'failed to respond'
+            '502|503|504'
+            'ERROR|FATAL|CRASHED|FAILED'
+          )
 
-          grep -Eiq 'bzip2.*not a bzip2|tar.*error.*not recoverable' railway-all.log &&             echo "::error::Firefox archive mismatch: unduhan Mozilla sekarang TAR.XZ, bukan TAR.BZ2." || true
+          found=0
+          for pattern in "${patterns[@]}"; do
+            if grep -Eiq "${pattern}" railway-all.log; then
+              echo "::error::Detected: ${pattern}"
+              found=1
+            fi
+          done
 
-          grep -Eiq 'healthcheck|service unavailable|failed to respond|502|503|504' railway-all.log &&             echo "::error::Railway healthcheck/service error terdeteksi." || true
+          if [ "$found" -eq 0 ]; then
+            echo "Tidak ada pola error yang dikenal."
+          fi
 
-          grep -Eiq 'apt.*exit code: 100|dpkg.*error|command.*not found|no installation candidate' railway-all.log &&             echo "::error::Linux package/runtime error terdeteksi." || true
-
-          grep -Eiq 'permission denied|cannot open display|DISPLAY.*not set|Xvfb.*failed|x11vnc.*failed|websockify.*failed|noVNC' railway-all.log &&             echo "::error::Desktop/X11/noVNC startup error terdeteksi." || true
-
-          grep -Eiq 'ERROR|FATAL|CRASHED|FAILED|exit code' railway-all.log &&             echo "::warning::Railway log mengandung error/failure. Lihat artifact untuk detail lengkap." || true
-
-      - name: Upload Railway logs
+      - name: Upload diagnostics
         uses: actions/upload-artifact@v4
         with:
           name: railway-ubuntu-error-logs
