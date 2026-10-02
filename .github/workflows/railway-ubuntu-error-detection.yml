@@ -1,0 +1,203 @@
+name: Railway Ubuntu Error Detection
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+  deployment_status:
+
+permissions:
+  contents: read
+  deployments: read
+
+concurrency:
+  group: railway-ubuntu-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  validate:
+    name: Validate Ubuntu Desktop
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Check required files
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f Dockerfile || { echo "::error::Dockerfile tidak ditemukan"; exit 1; }
+          test -f start.sh || { echo "::error::start.sh tidak ditemukan"; exit 1; }
+
+      - name: Validate Dockerfile
+        shell: bash
+        run: |
+          set -euo pipefail
+          grep -q '^FROM ubuntu:24.04' Dockerfile || {
+            echo "::error::Dockerfile harus menggunakan Ubuntu 24.04"
+            exit 1
+          }
+
+          grep -q 'ENV DISPLAY=:1' Dockerfile || {
+            echo "::error::DISPLAY=:1 belum dikonfigurasi"
+            exit 1
+          }
+
+          grep -q 'ENTRYPOINT' Dockerfile || {
+            echo "::error::ENTRYPOINT belum dikonfigurasi"
+            exit 1
+          }
+
+          if grep -Eq '\bfirefox-esr\b' Dockerfile; then
+            echo "::error::firefox-esr tidak tersedia sebagai paket apt Ubuntu 24.04 pada image ini. Gunakan Firefox binary/Snap alternative."
+            exit 1
+          fi
+
+      - name: Validate startup script
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash -n start.sh
+          grep -q 'PORT=\${PORT:-8080}' start.sh || {
+            echo "::error::start.sh harus menggunakan PORT dari Railway"
+            exit 1
+          }
+          grep -q 'Xvfb' start.sh || {
+            echo "::error::Xvfb tidak ditemukan"
+            exit 1
+          }
+          grep -q 'x11vnc' start.sh || {
+            echo "::error::x11vnc tidak ditemukan"
+            exit 1
+          }
+          grep -q 'websockify' start.sh || {
+            echo "::error::websockify/noVNC tidak ditemukan"
+            exit 1
+          }
+
+      - name: Build Docker image
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker build --pull -t max-ubuntu-ci:latest .
+
+      - name: Inspect image
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker image inspect max-ubuntu-ci:latest >/dev/null
+          docker image inspect max-ubuntu-ci:latest             --format 'Image={{.Id}} Entrypoint={{json .Config.Entrypoint}}'
+
+  railway-logs:
+    name: Detect Railway Errors
+    if: github.event_name == 'deployment_status' && github.event.deployment_status.state == 'failure'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Install Railway CLI
+        run: npm install -g @railway/cli
+
+      - name: Read failed Railway deployment
+        env:
+          RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
+          PROJECT_ID: 33792731-b4ce-4d44-9ee6-4ab970366d50
+          SERVICE: max-ubuntu
+          ENVIRONMENT: production
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [ -z "${RAILWAY_TOKEN:-}" ]; then
+            echo "::error::GitHub secret RAILWAY_TOKEN belum dibuat. Tambahkan token Railway agar workflow bisa membaca log deployment."
+            exit 1
+          fi
+
+          echo "Railway deployment gagal."
+          echo "Environment: ${ENVIRONMENT}"
+          echo "Service: ${SERVICE}"
+          echo "Deployment: ${{ github.event.deployment_status.deployment_id }}"
+
+          railway logs \
+            --project "${PROJECT_ID}" \
+            --service "${SERVICE}" \
+            --environment "${ENVIRONMENT}" \
+            --latest \
+            --lines 300 \
+            --json > railway-logs.json || true
+
+          echo "===== RAILWAY ERROR SUMMARY ====="
+          if [ -s railway-logs.json ]; then
+            cat railway-logs.json
+          else
+            echo "Log Railway tidak dapat diambil."
+          fi
+
+      - name: Detect known errors
+        env:
+          RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
+          PROJECT_ID: 33792731-b4ce-4d44-9ee6-4ab970366d50
+          SERVICE: max-ubuntu
+          ENVIRONMENT: production
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          railway logs \
+            --project "${PROJECT_ID}" \
+            --service "${SERVICE}" \
+            --environment "${ENVIRONMENT}" \
+            --latest \
+            --lines 500 \
+            --build > railway-build.log 2>&1 || true
+
+          echo "===== DETECTED ERROR PATTERNS ====="
+
+          if grep -Eiq 'firefox-esr.*no installation candidate|Package .firefox-esr. has no installation candidate' railway-build.log; then
+            echo "::error::Firefox package error: firefox-esr tidak tersedia pada Ubuntu 24.04 image."
+          fi
+
+          if grep -Eiq 'healthcheck|service unavailable|failed to respond|502|503|504' railway-build.log; then
+            echo "::error::Railway service/healthcheck error terdeteksi."
+          fi
+
+          if grep -Eiq 'apt.*exit code: 100|E: .*failed|dpkg.*error|command.*not found' railway-build.log; then
+            echo "::error::Linux package/runtime error terdeteksi."
+          fi
+
+          if grep -Eiq 'permission denied|cannot open display|DISPLAY.*not set|Xvfb.*failed|x11vnc.*failed|websockify.*failed' railway-build.log; then
+            echo "::error::Desktop/X11/noVNC startup error terdeteksi."
+          fi
+
+          if grep -Eiq 'ERROR|FATAL|CRASHED|FAILED' railway-build.log; then
+            echo "::warning::Railway log mengandung ERROR/FATAL/CRASHED/FAILED. Buka artifact/log di workflow untuk diagnosis lengkap."
+          fi
+
+      - name: Upload Railway logs
+        uses: actions/upload-artifact@v4
+        with:
+          name: railway-ubuntu-error-logs
+          path: |
+            railway-logs.json
+            railway-build.log
+          if-no-files-found: ignore
+          retention-days: 14
+
+  success-check:
+    name: Final Check
+    needs: [validate]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Result
+        shell: bash
+        run: |
+          if [ "${{ needs.validate.result }}" != "success" ]; then
+            echo "::error::Validasi Ubuntu Desktop gagal."
+            exit 1
+          fi
+          echo "Ubuntu Desktop validation OK."
