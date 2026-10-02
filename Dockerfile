@@ -20,7 +20,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
-RUN useradd -m -s /bin/bash ubuntu && \
+RUN if id -u ubuntu >/dev/null 2>&1; then \
+      echo "ubuntu user already exists"; \
+    else \
+      useradd -m -s /bin/bash ubuntu; \
+    fi && \
     echo 'ubuntu ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/ubuntu && \
     chmod 0440 /etc/sudoers.d/ubuntu
 
