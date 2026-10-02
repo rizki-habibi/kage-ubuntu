@@ -30,67 +30,67 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          test -f Dockerfile || { echo "::error::Dockerfile tidak ditemukan"; exit 1; }
-          test -f start.sh || { echo "::error::start.sh tidak ditemukan"; exit 1; }
+          test -f Dockerfile
+          test -f start.sh
 
-      - name: Validate Dockerfile
+      - name: Validate Dockerfile and startup script
         shell: bash
         run: |
           set -euo pipefail
-          grep -q '^FROM ubuntu:24.04' Dockerfile || {
-            echo "::error::Dockerfile harus menggunakan Ubuntu 24.04"
-            exit 1
-          }
 
-          grep -q 'ENV DISPLAY=:1' Dockerfile || {
-            echo "::error::DISPLAY=:1 belum dikonfigurasi"
-            exit 1
-          }
+          grep -q '^FROM ubuntu:24.04' Dockerfile
+          grep -q 'ENTRYPOINT' Dockerfile
+          grep -q 'x11-utils' Dockerfile
+          grep -q 'firefox.tar.xz' Dockerfile
+          grep -q 'tar -xJf' Dockerfile
+          ! grep -Eq '\\bfirefox-esr\\b' Dockerfile
 
-          grep -q 'ENTRYPOINT' Dockerfile || {
-            echo "::error::ENTRYPOINT belum dikonfigurasi"
-            exit 1
-          }
-
-          if grep -Eq '\bfirefox-esr\b' Dockerfile; then
-            echo "::error::firefox-esr tidak tersedia sebagai paket apt Ubuntu 24.04 pada image ini. Gunakan Firefox binary/Snap alternative."
-            exit 1
-          fi
-
-      - name: Validate startup script
-        shell: bash
-        run: |
-          set -euo pipefail
           bash -n start.sh
-          grep -q 'PORT=\${PORT:-8080}' start.sh || {
-            echo "::error::start.sh harus menggunakan PORT dari Railway"
-            exit 1
-          }
-          grep -q 'Xvfb' start.sh || {
-            echo "::error::Xvfb tidak ditemukan"
-            exit 1
-          }
-          grep -q 'x11vnc' start.sh || {
-            echo "::error::x11vnc tidak ditemukan"
-            exit 1
-          }
-          grep -q 'websockify' start.sh || {
-            echo "::error::websockify/noVNC tidak ditemukan"
-            exit 1
-          }
+          grep -q 'PORT=${PORT:-8080}' start.sh
+          grep -q 'Xvfb' start.sh
+          grep -q 'xdpyinfo' start.sh
+          grep -q 'x11vnc' start.sh
+          grep -q 'websockify' start.sh
+          grep -q '/vnc.html' start.sh
 
       - name: Build Docker image
         shell: bash
         run: |
           set -euo pipefail
-          docker build --pull -t max-ubuntu-ci:latest .
+          docker build --pull --progress=plain -t max-ubuntu-ci:latest .
 
-      - name: Inspect image
+      - name: Smoke test desktop container
         shell: bash
         run: |
-          set -euo pipefail
-          docker image inspect max-ubuntu-ci:latest >/dev/null
-          docker image inspect max-ubuntu-ci:latest             --format 'Image={{.Id}} Entrypoint={{json .Config.Entrypoint}}'
+          set -Eeuo pipefail
+
+          docker run -d --name max-ubuntu-smoke -e PORT=8080 -p 18080:8080 max-ubuntu-ci:latest
+
+          cleanup() {
+            docker logs max-ubuntu-smoke || true
+            docker rm -f max-ubuntu-smoke >/dev/null 2>&1 || true
+          }
+          trap cleanup EXIT
+
+          ready=0
+          for i in $(seq 1 90); do
+            if curl -fsS --max-time 2 http://127.0.0.1:18080/vnc.html >/dev/null; then
+              ready=1
+              break
+            fi
+            if ! docker inspect -f '{{.State.Running}}' max-ubuntu-smoke 2>/dev/null | grep -q true; then
+              echo "::error::Container berhenti sebelum noVNC siap."
+              exit 1
+            fi
+            sleep 1
+          done
+
+          if [ "$ready" -ne 1 ]; then
+            echo "::error::noVNC tidak merespons pada PORT 8080."
+            exit 1
+          fi
+
+          echo "Ubuntu desktop smoke test OK."
 
   railway-logs:
     name: Detect Railway Errors
@@ -108,82 +108,56 @@ jobs:
           PROJECT_ID: 33792731-b4ce-4d44-9ee6-4ab970366d50
           SERVICE: max-ubuntu
           ENVIRONMENT: production
+          DEPLOYMENT_ID: ${{ github.event.deployment_status.deployment_id }}
         shell: bash
         run: |
-          set -euo pipefail
+          set -Eeuo pipefail
 
           if [ -z "${RAILWAY_TOKEN:-}" ]; then
-            echo "::error::GitHub secret RAILWAY_TOKEN belum dibuat. Tambahkan token Railway agar workflow bisa membaca log deployment."
-            exit 1
+            echo "::warning::RAILWAY_TOKEN belum tersedia; validasi Docker tetap berjalan, tetapi log Railway tidak dapat dibaca dari GitHub Actions."
+            exit 0
           fi
 
-          echo "Railway deployment gagal."
-          echo "Environment: ${ENVIRONMENT}"
-          echo "Service: ${SERVICE}"
-          echo "Deployment: ${{ github.event.deployment_status.deployment_id }}"
+          railway logs "${DEPLOYMENT_ID}" --project "${PROJECT_ID}" --service "${SERVICE}" --environment "${ENVIRONMENT}" --lines 500 --json > railway-deploy.json || true
+          railway logs "${DEPLOYMENT_ID}" --project "${PROJECT_ID}" --service "${SERVICE}" --environment "${ENVIRONMENT}" --build --lines 500 --json > railway-build.json || true
+          railway logs "${DEPLOYMENT_ID}" --project "${PROJECT_ID}" --service "${SERVICE}" --environment "${ENVIRONMENT}" --http --lines 200 --json > railway-http.json || true
 
-          railway logs \
-            --project "${PROJECT_ID}" \
-            --service "${SERVICE}" \
-            --environment "${ENVIRONMENT}" \
-            --latest \
-            --lines 300 \
-            --json > railway-logs.json || true
+          echo "===== RAILWAY DEPLOY LOG ====="
+          cat railway-deploy.json || true
+          echo "===== RAILWAY BUILD LOG ====="
+          cat railway-build.json || true
+          echo "===== RAILWAY HTTP LOG ====="
+          cat railway-http.json || true
 
-          echo "===== RAILWAY ERROR SUMMARY ====="
-          if [ -s railway-logs.json ]; then
-            cat railway-logs.json
-          else
-            echo "Log Railway tidak dapat diambil."
-          fi
-
-      - name: Detect known errors
-        env:
-          RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
-          PROJECT_ID: 33792731-b4ce-4d44-9ee6-4ab970366d50
-          SERVICE: max-ubuntu
-          ENVIRONMENT: production
+      - name: Detect known Railway errors
+        if: always()
         shell: bash
         run: |
           set -euo pipefail
-
-          railway logs \
-            --project "${PROJECT_ID}" \
-            --service "${SERVICE}" \
-            --environment "${ENVIRONMENT}" \
-            --latest \
-            --lines 500 \
-            --build > railway-build.log 2>&1 || true
+          touch railway-deploy.json railway-build.json railway-http.json
+          cat railway-deploy.json railway-build.json railway-http.json > railway-all.log
 
           echo "===== DETECTED ERROR PATTERNS ====="
 
-          if grep -Eiq 'firefox-esr.*no installation candidate|Package .firefox-esr. has no installation candidate' railway-build.log; then
-            echo "::error::Firefox package error: firefox-esr tidak tersedia pada Ubuntu 24.04 image."
-          fi
+          grep -Eiq 'bzip2.*not a bzip2|tar.*error.*not recoverable' railway-all.log &&             echo "::error::Firefox archive mismatch: unduhan Mozilla sekarang TAR.XZ, bukan TAR.BZ2." || true
 
-          if grep -Eiq 'healthcheck|service unavailable|failed to respond|502|503|504' railway-build.log; then
-            echo "::error::Railway service/healthcheck error terdeteksi."
-          fi
+          grep -Eiq 'healthcheck|service unavailable|failed to respond|502|503|504' railway-all.log &&             echo "::error::Railway healthcheck/service error terdeteksi." || true
 
-          if grep -Eiq 'apt.*exit code: 100|E: .*failed|dpkg.*error|command.*not found' railway-build.log; then
-            echo "::error::Linux package/runtime error terdeteksi."
-          fi
+          grep -Eiq 'apt.*exit code: 100|dpkg.*error|command.*not found|no installation candidate' railway-all.log &&             echo "::error::Linux package/runtime error terdeteksi." || true
 
-          if grep -Eiq 'permission denied|cannot open display|DISPLAY.*not set|Xvfb.*failed|x11vnc.*failed|websockify.*failed' railway-build.log; then
-            echo "::error::Desktop/X11/noVNC startup error terdeteksi."
-          fi
+          grep -Eiq 'permission denied|cannot open display|DISPLAY.*not set|Xvfb.*failed|x11vnc.*failed|websockify.*failed|noVNC' railway-all.log &&             echo "::error::Desktop/X11/noVNC startup error terdeteksi." || true
 
-          if grep -Eiq 'ERROR|FATAL|CRASHED|FAILED' railway-build.log; then
-            echo "::warning::Railway log mengandung ERROR/FATAL/CRASHED/FAILED. Buka artifact/log di workflow untuk diagnosis lengkap."
-          fi
+          grep -Eiq 'ERROR|FATAL|CRASHED|FAILED|exit code' railway-all.log &&             echo "::warning::Railway log mengandung error/failure. Lihat artifact untuk detail lengkap." || true
 
       - name: Upload Railway logs
         uses: actions/upload-artifact@v4
         with:
           name: railway-ubuntu-error-logs
           path: |
-            railway-logs.json
-            railway-build.log
+            railway-deploy.json
+            railway-build.json
+            railway-http.json
+            railway-all.log
           if-no-files-found: ignore
           retention-days: 14
 
