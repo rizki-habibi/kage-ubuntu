@@ -17,9 +17,7 @@ Xvfb :1 -screen 0 "$RESOLUTION" -ac +extension GLX +render -noreset >/tmp/xvfb.l
 XVFB_PID=$!
 
 for i in $(seq 1 30); do
-  if xdpyinfo -display :1 >/dev/null 2>&1; then
-    break
-  fi
+  if xdpyinfo -display :1 >/dev/null 2>&1; then break; fi
   sleep 1
 done
 
@@ -29,15 +27,19 @@ if ! xdpyinfo -display :1 >/dev/null 2>&1; then
   exit 1
 fi
 
-echo "[max-ubuntu] starting XFCE"
-dbus-launch --exit-with-session startxfce4 >/tmp/xfce.log 2>&1 &
-XFCE_PID=$!
+echo "[max-ubuntu] starting Ubuntu GNOME desktop"
+rm -rf /tmp/runtime-ubuntu
+mkdir -p /tmp/runtime-ubuntu
+chown ubuntu:ubuntu /tmp/runtime-ubuntu
+chmod 700 /tmp/runtime-ubuntu
 
-sleep 3
+su - ubuntu -c 'export DISPLAY=:1 XDG_RUNTIME_DIR=/tmp/runtime-ubuntu DBUS_SESSION_BUS_ADDRESS=; dbus-run-session -- gnome-session --session=ubuntu' >/tmp/gnome.log 2>&1 &
+DESKTOP_PID=$!
 
-if ! kill -0 "$XFCE_PID" 2>/dev/null; then
-  echo "[max-ubuntu] XFCE process exited"
-  cat /tmp/xfce.log || true
+sleep 5
+if ! kill -0 "$DESKTOP_PID" 2>/dev/null; then
+  echo "[max-ubuntu] GNOME process exited"
+  cat /tmp/gnome.log || true
   exit 1
 fi
 
@@ -70,6 +72,5 @@ if ! curl -fsS --max-time 2 "http://127.0.0.1:$PORT/vnc.html" >/dev/null 2>&1; t
   exit 1
 fi
 
-trap 'kill "$NOVNC_PID" "$VNC_PID" "$XFCE_PID" "$XVFB_PID" 2>/dev/null || true' EXIT INT TERM
-
+trap 'kill "$NOVNC_PID" "$VNC_PID" "$DESKTOP_PID" "$XVFB_PID" 2>/dev/null || true' EXIT INT TERM
 wait "$NOVNC_PID"
