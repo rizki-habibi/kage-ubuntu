@@ -3,6 +3,8 @@ set -Eeuo pipefail
 
 export DISPLAY=:1
 export XDG_RUNTIME_DIR=/tmp/runtime-root
+export XDG_CURRENT_DESKTOP=ubuntu:GNOME
+export XDG_SESSION_TYPE=x11
 mkdir -p "$XDG_RUNTIME_DIR"
 chmod 700 "$XDG_RUNTIME_DIR"
 
@@ -27,16 +29,32 @@ if ! xdpyinfo -display :1 >/dev/null 2>&1; then
   exit 1
 fi
 
+echo "[max-ubuntu] starting system D-Bus"
+rm -f /run/dbus/pid /run/dbus/system_bus_socket || true
+dbus-daemon --system --fork --nopidfile >/tmp/dbus-system.log 2>&1 &
+DBUS_SYSTEM_PID=$!
+
+for i in $(seq 1 20); do
+  if [ -S /run/dbus/system_bus_socket ]; then break; fi
+  sleep 1
+done
+
+if [ ! -S /run/dbus/system_bus_socket ]; then
+  echo "[max-ubuntu] system D-Bus failed"
+  cat /tmp/dbus-system.log || true
+  exit 1
+fi
+
 echo "[max-ubuntu] starting Ubuntu GNOME desktop"
 rm -rf /tmp/runtime-ubuntu
 mkdir -p /tmp/runtime-ubuntu
 chown ubuntu:ubuntu /tmp/runtime-ubuntu
 chmod 700 /tmp/runtime-ubuntu
 
-su - ubuntu -c 'export DISPLAY=:1 XDG_RUNTIME_DIR=/tmp/runtime-ubuntu DBUS_SESSION_BUS_ADDRESS=; dbus-run-session -- gnome-session --session=ubuntu' >/tmp/gnome.log 2>&1 &
+su - ubuntu -c 'export DISPLAY=:1 XDG_RUNTIME_DIR=/tmp/runtime-ubuntu XDG_CURRENT_DESKTOP=ubuntu:GNOME XDG_SESSION_TYPE=x11; dbus-run-session -- gnome-session --session=ubuntu' >/tmp/gnome.log 2>&1 &
 DESKTOP_PID=$!
 
-sleep 5
+sleep 8
 if ! kill -0 "$DESKTOP_PID" 2>/dev/null; then
   echo "[max-ubuntu] GNOME process exited"
   cat /tmp/gnome.log || true
@@ -72,5 +90,5 @@ if ! curl -fsS --max-time 2 "http://127.0.0.1:$PORT/vnc.html" >/dev/null 2>&1; t
   exit 1
 fi
 
-trap 'kill "$NOVNC_PID" "$VNC_PID" "$DESKTOP_PID" "$XVFB_PID" 2>/dev/null || true' EXIT INT TERM
+trap 'kill "$NOVNC_PID" "$VNC_PID" "$DESKTOP_PID" "$XVFB_PID" "$DBUS_SYSTEM_PID" 2>/dev/null || true' EXIT INT TERM
 wait "$NOVNC_PID"
